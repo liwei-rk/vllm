@@ -284,7 +284,78 @@ decode请求 `query_len=1`（每步只算1个token），prefill请求 `query_len
 
 ---
 
-## 八、关键配置参数
+## 八、混合批次与 CUDA Graph 的关系
+
+### 核心规则：混合批次整体回退到 eager 模式
+
+混合 prefill + decode 的批次**不能使用 CUDA graph**，整个批次回退到 eager 模式。只有纯 decode 批次才走 CUDA graph。
+
+### CUDA Graph 使用条件
+
+FlashInfer 后端（`flashinfer.py:1205-1209`）：
+
+```python
+pure_decode = num_prefills == 0   # 必须无prefill请求
+use_cudagraph = (
+    self.enable_cuda_graph
+    and pure_decode               # 不是纯decode → 不用cudagraph
+    and num_decode_tokens <= self._decode_cudagraph_max_bs
+)
+```
+
+同样在 `CudagraphDispatcher.dispatch()`（`cudagraph_dispatcher.py:301`）：
+
+```python
+normalized_uniform = uniform_decode and self.cudagraph_mode.separate_routine()
+```
+
+只有 `uniform_decode=True`（所有请求 query_len 相同且都已完成 prefill）时才走 FULL cudagraph。
+
+### 批次类型与执行模式
+
+| 批次类型 | 执行模式 |
+|---------|---------|
+| 纯 decode（`num_prefills==0`） | **CUDA graph**（图模式） |
+| 混合 prefill + decode | **eager**（全部回退） |
+| 纯 prefill | **eager** |
+
+### CUDAGraphMode 配置的影响
+
+| 模式 | 纯 decode 批次 | 混合批次 |
+|------|---------------|---------|
+| `FULL_DECODE_ONLY`（最常用） | FULL cudagraph | NONE（eager） |
+| `FULL_AND_PIECEWISE` | FULL cudagraph | PIECEWISE cudagraph |
+| `FULL` | FULL cudagraph | FULL cudagraph（需attention后端支持`ALWAYS`） |
+
+FlashInfer 不支持 `ALWAYS`，所以默认用 `FULL_DECODE_ONLY`——混合批次走 eager。
+
+### 混合批次中 prefill 和 decode 的 attention 处理
+
+虽然整体是 eager 模式，FlashInfer 仍然**分别调用两个不同的 wrapper**：
+
+```python
+# flashinfer.py:1690-1746 (decode部分，eager wrapper)
+decode_output = decode_wrapper.run(...)   # BatchDecodeWithPagedKVCacheWrapper
+
+# flashinfer.py:1514-1579 (prefill部分)
+prefill_output = prefill_wrapper.run(...) # BatchPrefillWithPagedKVCacheWrapper
+```
+
+只是都用 eager 版本的 wrapper（非 cudagraph 专用 wrapper）。cudagraph 专用 decode wrapper 在纯 decode 时使用，特点是：
+- 每个 batch size 有独立的 wrapper（`_decode_wrappers_cudagraph`），因为 cudagraph 要求固定 tensor shape
+- 使用 `fast_decode_plan` 优化 plan 过程，仅做 H2D copy，避免 D2D copy
+- 有预分配的持久化 buffer（`paged_kv_indptr`, `paged_kv_indices`, `paged_kv_last_page_len`）
+
+### 设计权衡
+
+混合批次可以同时包含 prefill 和 decode 请求，但代价是牺牲 CUDA graph 加速。vLLM 通过以下参数控制混合频率：
+- `reorder_batch_threshold`：决定哪些请求被视为"decode"
+- `max_num_partial_prefills` / `max_long_partial_prefills`：限制并发部分 prefill 数量
+- `long_prefill_token_threshold`：控制 prefill chunk 大小，减少 prefill 对 decode 的干扰
+
+---
+
+## 九、关键配置参数
 
 | 参数 | 默认值 | 作用 |
 |---|---|---|
@@ -297,7 +368,7 @@ decode请求 `query_len=1`（每步只算1个token），prefill请求 `query_len
 
 ---
 
-## 九、整体流程图
+## 十、整体流程图
 
 ```
 EngineCore.step():
