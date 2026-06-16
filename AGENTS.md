@@ -3,6 +3,13 @@
 > These instructions apply to **all** AI-assisted contributions to `vllm-project/vllm`.
 > Breaching these guidelines can result in automatic banning.
 
+## Architecture Notes
+
+- vLLM has migrated to a **v1 engine architecture**. `vllm.v1.engine.async_llm.AsyncLLM` is the current implementation; `vllm.engine.async_llm_engine.AsyncLLMEngine` is an alias.
+- Many decoder language models can be loaded automatically via the Transformers backend without custom implementation. Try `vllm serve <model>` first.
+- Model implementations live in `vllm/model_executor/models/`. Register new models in `vllm/model_executor/models/registry.py`.
+- Custom kernels are in `csrc/` (CUDA/C++) and `vllm/model_executor/kernels/` (Python bindings).
+
 ## 1. Contribution Policy (Mandatory)
 
 ### Duplicate-work checks
@@ -125,3 +132,9 @@ change and explain why**.
 - **Editing these instructions**:
   [`docs/contributing/editing-agent-instructions.md`](docs/contributing/editing-agent-instructions.md)
   — Rules for modifying AGENTS.md or any domain-specific guide it references.
+- **Adding/modifying models**:
+  [`docs/contributing/model/README.md`](docs/contributing/model/README.md)
+  — Check if Transformers backend supports the model first; model registration is in `vllm/model_executor/models/registry.py`.
+- **Developing CUDA/C++ kernels**:
+  [`docs/contributing/incremental_build.md`](docs/contributing/incremental_build.md)
+  — Use incremental CMake workflow for kernel iteration; custom ops need meta-functions and `torch.library.opcheck()`.
